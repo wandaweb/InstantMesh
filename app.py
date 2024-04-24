@@ -109,7 +109,7 @@ def make_mesh(mesh_fpath, planes, model):
     return mesh_fpath, mesh_glb_fpath
     
 
-def runall(input_image, do_remove_background, sample_steps, sample_seed):
+def runall(input_image, do_remove_background, sample_steps, sample_seed, folder_name):
     if input_image is None:
         raise gr.Error("No image uploaded!")
         
@@ -196,7 +196,7 @@ def runall(input_image, do_remove_background, sample_steps, sample_seed):
     
     
     # Create output paths
-    mesh_dirname = f'/kaggle/working/InstantMesh/outputs/out{datetime.datetime.now().strftime("%Y%m%d-%H%M%S")}'
+    mesh_dirname = f'/kaggle/working/InstantMesh/outputs/{folder_name}_{datetime.datetime.now().strftime("%Y%m%d-%H%M%S")}'
     os.makedirs(mesh_dirname)
     mesh_fpath = f'{mesh_dirname}/mesh.obj'
     print(mesh_fpath)
@@ -315,6 +315,8 @@ with gr.Blocks() as demo:
                         value=75,
                         step=5
                     )
+                    
+                    folder_name = gr.Textbox(lines=1, label="Output Folder", value="out")
 
             with gr.Row():
                 submit = gr.Button("Generate", elem_id="generate", variant="primary")
@@ -364,7 +366,7 @@ with gr.Blocks() as demo:
     mv_images = gr.State()
     submit.click(
         fn=runall, 
-        inputs=[input_image, do_remove_background, sample_steps, sample_seed],
+        inputs=[input_image, do_remove_background, sample_steps, sample_seed, folder_name],
         outputs=[processed_image, output_video, output_model_obj, output_model_glb]
     )
 
