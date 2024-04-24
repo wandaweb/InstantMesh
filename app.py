@@ -1,7 +1,9 @@
-import os
+import datetime
+import gc
 import imageio
 import numpy as np
 import torch
+import os
 import rembg
 from PIL import Image
 from torchvision.transforms import v2
@@ -17,11 +19,22 @@ from src.utils.camera_util import (
     get_zero123plus_input_cameras,
     get_circular_camera_poses,
 )
-from src.utils.mesh_util import save_obj, save_glb
+from src.utils.mesh_util import save_obj, save_glb, save_obj_with_mtl
 from src.utils.infer_util import remove_background, resize_foreground, images_to_video
 
 import tempfile
 from huggingface_hub import hf_hub_download
+
+# Configuration
+device = torch.device('cuda')
+
+config_path = 'configs/instant-mesh-base.yaml'
+config = OmegaConf.load(config_path)
+config_name = os.path.basename(config_path).replace('.yaml', '')
+model_config = config.model_config
+infer_config = config.infer_config
+
+IS_FLEXICUBES = True if config_name.startswith('instant-mesh') else False
 
 
 def get_render_cameras(batch_size=1, M=120, radius=2.5, elevation=10.0, is_flexicubes=False):
@@ -54,76 +67,102 @@ def images_to_video(images, output_path, fps=30):
     imageio.mimwrite(output_path, np.stack(frames), fps=fps, codec='h264')
 
 
-###############################################################################
-# Configuration.
-###############################################################################
+def make_mesh(mesh_fpath, planes, model):
 
-seed_everything(0)
+    mesh_basename = os.path.basename(mesh_fpath).split('.')[0]
+    mesh_dirname = os.path.dirname(mesh_fpath)
+    mesh_glb_fpath = os.path.join(mesh_dirname, f"{mesh_basename}.glb")
+        
+    with torch.no_grad():
+        # get mesh
+        mesh_out = model.extract_mesh(
+            planes,
+            use_texture_map=False,
+            **infer_config,
+        )
 
-config_path = 'configs/instant-mesh-large.yaml'
-config = OmegaConf.load(config_path)
-config_name = os.path.basename(config_path).replace('.yaml', '')
-model_config = config.model_config
-infer_config = config.infer_config
+        vertices, faces, vertex_colors = mesh_out
+        vertices = vertices[:, [1, 2, 0]]
 
-IS_FLEXICUBES = True if config_name.startswith('instant-mesh') else False
+        save_glb(vertices, faces, vertex_colors, mesh_glb_fpath)
+        save_obj(vertices, faces, vertex_colors, mesh_fpath)
+        
+        print(f"Mesh saved to {mesh_fpath}")
+        
+        mesh_out = model.extract_mesh(
+            planes,
+            use_texture_map=True,
+            **infer_config,
+        )
+        vertices, faces, uvs, mesh_tex_idx, tex_map = mesh_out
+        mesh_path_idx = os.path.join(mesh_dirname, f'mesh_mat.obj')
+        save_obj_with_mtl(
+                vertices.data.cpu().numpy(),
+                uvs.data.cpu().numpy(),
+                faces.data.cpu().numpy(),
+                mesh_tex_idx.data.cpu().numpy(),
+                tex_map.permute(1, 2, 0).data.cpu().numpy(),
+                mesh_path_idx,
+        )
+        
 
-device = torch.device('cuda')
+    return mesh_fpath, mesh_glb_fpath
+    
 
-# load diffusion model
-print('Loading diffusion model ...')
-pipeline = DiffusionPipeline.from_pretrained(
-    "sudo-ai/zero123plus-v1.2", 
-    custom_pipeline="zero123plus",
-    torch_dtype=torch.float16,
-)
-pipeline.scheduler = EulerAncestralDiscreteScheduler.from_config(
-    pipeline.scheduler.config, timestep_spacing='trailing'
-)
-
-# load custom white-background UNet
-unet_ckpt_path = hf_hub_download(repo_id="TencentARC/InstantMesh", filename="diffusion_pytorch_model.bin", repo_type="model")
-state_dict = torch.load(unet_ckpt_path, map_location='cpu')
-pipeline.unet.load_state_dict(state_dict, strict=True)
-
-pipeline = pipeline.to(device)
-
-# load reconstruction model
-print('Loading reconstruction model ...')
-model_ckpt_path = hf_hub_download(repo_id="TencentARC/InstantMesh", filename="instant_mesh_large.ckpt", repo_type="model")
-model = instantiate_from_config(model_config)
-state_dict = torch.load(model_ckpt_path, map_location='cpu')['state_dict']
-state_dict = {k[14:]: v for k, v in state_dict.items() if k.startswith('lrm_generator.') and 'source_camera' not in k}
-model.load_state_dict(state_dict, strict=True)
-
-model = model.to(device)
-if IS_FLEXICUBES:
-    model.init_flexicubes_geometry(device, fovy=30.0)
-model = model.eval()
-
-print('Loading Finished!')
-
-
-def check_input_image(input_image):
+def runall(input_image, do_remove_background, sample_steps, sample_seed):
     if input_image is None:
         raise gr.Error("No image uploaded!")
+        
+    # Configuration
+    config_path = 'configs/instant-mesh-base.yaml'
+    config = OmegaConf.load(config_path)
+    config_name = os.path.basename(config_path).replace('.yaml', '')
+    model_config = config.model_config
+    infer_config = config.infer_config
 
+    IS_FLEXICUBES = True if config_name.startswith('instant-mesh') else False
 
-def preprocess(input_image, do_remove_background):
+    # load diffusion model
+    print('Loading diffusion model ...')
+    pipeline = DiffusionPipeline.from_pretrained(
+        "sudo-ai/zero123plus-v1.2", 
+        custom_pipeline="zero123plus",
+        torch_dtype=torch.float16,
+    )
+    pipeline.scheduler = EulerAncestralDiscreteScheduler.from_config(
+        pipeline.scheduler.config, timestep_spacing='trailing'
+    )
 
+    # load custom white-background UNet
+    unet_ckpt_path = hf_hub_download(repo_id="TencentARC/InstantMesh", filename="diffusion_pytorch_model.bin", repo_type="model")
+    state_dict = torch.load(unet_ckpt_path, map_location='cpu')
+    pipeline.unet.load_state_dict(state_dict, strict=True)
+
+    pipeline = pipeline.to(device)
+    
+    # Remove background
     rembg_session = rembg.new_session() if do_remove_background else None
     if do_remove_background:
         input_image = remove_background(input_image, rembg_session)
         input_image = resize_foreground(input_image, 0.85)
-
-    return input_image
-
-
-def generate_mvs(input_image, sample_steps, sample_seed):
-
+        del rembg_session
+        
     seed_everything(sample_seed)
     
-    # sampling
+    # load reconstruction model
+    print('Loading reconstruction model ...')
+    model_ckpt_path = hf_hub_download(repo_id="TencentARC/InstantMesh", filename="instant_mesh_base.ckpt", repo_type="model")
+    model = instantiate_from_config(model_config)
+    state_dict = torch.load(model_ckpt_path, map_location='cpu')['state_dict']
+    state_dict = {k[14:]: v for k, v in state_dict.items() if k.startswith('lrm_generator.') and 'source_camera' not in k}
+    model.load_state_dict(state_dict, strict=True)
+
+    model = model.to(device)
+    if IS_FLEXICUBES:
+        model.init_flexicubes_geometry(device, fovy=30.0)
+    model = model.eval()
+
+    # Multi view
     generator = torch.Generator(device=device)
     z123_image = pipeline(
         input_image, 
@@ -136,41 +175,17 @@ def generate_mvs(input_image, sample_steps, sample_seed):
     show_image = rearrange(show_image, '(n h) (m w) c -> (n m) h w c', n=3, m=2)
     show_image = rearrange(show_image, '(n m) h w c -> (n h) (m w) c', n=2, m=3)
     show_image = Image.fromarray(show_image.numpy())
+    del pipeline
+    gc.collect()
+    torch.cuda.empty_cache()
 
-    return z123_image, show_image
-
-
-def make_mesh(mesh_fpath, planes):
-
-    mesh_basename = os.path.basename(mesh_fpath).split('.')[0]
-    mesh_dirname = os.path.dirname(mesh_fpath)
-    mesh_glb_fpath = os.path.join(mesh_dirname, f"{mesh_basename}.glb")
-        
-    with torch.no_grad():
-        # get mesh
-
-        mesh_out = model.extract_mesh(
-            planes,
-            use_texture_map=False,
-            **infer_config,
-        )
-
-        vertices, faces, vertex_colors = mesh_out
-        vertices = vertices[:, [1, 2, 0]]
-        
-        save_glb(vertices, faces, vertex_colors, mesh_glb_fpath)
-        save_obj(vertices, faces, vertex_colors, mesh_fpath)
-        
-        print(f"Mesh saved to {mesh_fpath}")
-
-    return mesh_fpath, mesh_glb_fpath
-
-
-def make3d(images):
-
+    images = z123_image
+    
     images = np.asarray(images, dtype=np.float32) / 255.0
     images = torch.from_numpy(images).permute(2, 0, 1).contiguous().float()     # (3, 960, 640)
     images = rearrange(images, 'c (n h) (m w) -> (n m) c h w', n=3, m=2)        # (6, 3, 320, 320)
+    
+    ## Reconstruction ##
 
     input_cameras = get_zero123plus_input_cameras(batch_size=1, radius=4.0).to(device)
     render_cameras = get_render_cameras(
@@ -178,11 +193,14 @@ def make3d(images):
 
     images = images.unsqueeze(0).to(device)
     images = v2.functional.resize(images, (320, 320), interpolation=3, antialias=True).clamp(0, 1)
-
-    mesh_fpath = tempfile.NamedTemporaryFile(suffix=f".obj", delete=False).name
+    
+    
+    # Create output paths
+    mesh_dirname = f'/kaggle/working/InstantMesh/outputs/out{datetime.datetime.now().strftime("%Y%m%d-%H%M%S")}'
+    os.makedirs(mesh_dirname)
+    mesh_fpath = f'{mesh_dirname}/mesh.obj'
     print(mesh_fpath)
     mesh_basename = os.path.basename(mesh_fpath).split('.')[0]
-    mesh_dirname = os.path.dirname(mesh_fpath)
     video_fpath = os.path.join(mesh_dirname, f"{mesh_basename}.mp4")
 
     with torch.no_grad():
@@ -217,11 +235,11 @@ def make3d(images):
         )
 
         print(f"Video saved to {video_fpath}")
+     
+    mesh_fpath, mesh_glb_fpath = make_mesh(mesh_fpath, planes, model)
 
-    mesh_fpath, mesh_glb_fpath = make_mesh(mesh_fpath, planes)
-
-    return video_fpath, mesh_fpath, mesh_glb_fpath
-
+    return input_image, video_fpath, mesh_fpath, mesh_glb_fpath
+    
 
 import gradio as gr
 
@@ -316,14 +334,6 @@ with gr.Blocks() as demo:
             with gr.Row():
 
                 with gr.Column():
-                    mv_show_images = gr.Image(
-                        label="Generated Multi-views",
-                        type="pil",
-                        width=379,
-                        interactive=False
-                    )
-
-                with gr.Column():
                     output_video = gr.Video(
                         label="video", format="mp4",
                         width=379,
@@ -352,20 +362,11 @@ with gr.Blocks() as demo:
 
     gr.Markdown(_CITE_)
     mv_images = gr.State()
-
-    submit.click(fn=check_input_image, inputs=[input_image]).success(
-        fn=preprocess,
-        inputs=[input_image, do_remove_background],
-        outputs=[processed_image],
-    ).success(
-        fn=generate_mvs,
-        inputs=[processed_image, sample_steps, sample_seed],
-        outputs=[mv_images, mv_show_images],
-    ).success(
-        fn=make3d,
-        inputs=[mv_images],
-        outputs=[output_video, output_model_obj, output_model_glb]
+    submit.click(
+        fn=runall, 
+        inputs=[input_image, do_remove_background, sample_steps, sample_seed],
+        outputs=[processed_image, output_video, output_model_obj, output_model_glb]
     )
 
 demo.queue(max_size=10)
-demo.launch(server_name="0.0.0.0", server_port=43839)
+demo.launch(server_name="0.0.0.0", server_port=7860, share=False)
